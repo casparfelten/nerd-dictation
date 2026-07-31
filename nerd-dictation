@@ -859,6 +859,42 @@ def process_text(
     return " ".join(words)
 
 
+def handle_progressive_text(
+    text: str,
+    is_partial: bool,
+    *,
+    progressive_continuous: bool,
+    text_list: List[str],
+    text_prev: str,
+    process_fn: Callable[[str], str],
+    handle_fn: Callable[[int, str], None],
+) -> str:
+    """Process one progressive recognizer update and return the current output."""
+    if progressive_continuous:
+        text_curr = process_fn(text)
+    else:
+        text_curr = process_fn(" ".join(text_list + ([text] if text else [])))
+
+    if text_curr != text_prev:
+        match = min(len(text_curr), len(text_prev))
+        for i in range(match):
+            if text_curr[i] != text_prev[i]:
+                match = i
+                break
+
+        # Emit text, deleting any previous incorrectly transcribed output.
+        handle_fn(len(text_prev) - match, text_curr[match:])
+        text_prev = text_curr
+
+    if not is_partial:
+        if progressive_continuous:
+            text_prev = ""
+        elif text:
+            text_list.append(text)
+
+    return text_prev
+
+
 # -----------------------------------------------------------------------------
 # Text from VOSK
 #
@@ -1033,31 +1069,18 @@ def text_from_vosk_pipe(
             handled_any = True
             return
 
-        # Progressive support (type as you speak).
-        if progressive_continuous:
-            text_curr = process_fn(text)
-        else:
-            text_curr = process_fn(" ".join(text_list + [text]))
+        text_prev = handle_progressive_text(
+            text,
+            is_partial_arg,
+            progressive_continuous=progressive_continuous,
+            text_list=text_list,
+            text_prev=text_prev,
+            process_fn=process_fn,
+            handle_fn=handle_fn,
+        )
 
-        if text_curr != text_prev:
-            match = min(len(text_curr), len(text_prev))
-            for i in range(min(len(text_curr), len(text_prev))):
-                if text_curr[i] != text_prev[i]:
-                    match = i
-                    break
-
-            # Emit text, deleting any previous incorrectly transcribed output
-            handle_fn(len(text_prev) - match, text_curr[match:])
-
-            text_prev = text_curr
-
-        if not is_partial_arg:
-            if progressive_continuous:
-                text_prev = ""
-            else:
-                text_list.append(text)
-
-        handled_any = True
+        if text:
+            handled_any = True
 
     # -----------------------------------------------
     # Utilities for accessing results on `rec` (VOSK)
@@ -1075,7 +1098,7 @@ def text_from_vosk_pipe(
         json_data = json.loads(json_text)
         text = json_data["text"]
         assert isinstance(text, str)
-        if text:
+        if text or progressive:
             handle_fn_wrapper(text, False)
         return json_text
 
@@ -1375,9 +1398,12 @@ def main_begin(
         #
         if process_fn_is_first or text == "":
             user_config = user_config_as_module_or_none(config_override=config_override, user_config_prev=user_config)
+            process_fn_is_first = False
 
         if not text:
-            return ""
+            if user_config is not None:
+                text = process_text_with_user_config(user_config, text)
+            return text
 
         #
         # Simple text post processing and capitalization.
@@ -1403,8 +1429,6 @@ def main_begin(
                 text = ". " + text
             else:
                 text = ", " + text
-
-        process_fn_is_first = False
 
         return text
 
